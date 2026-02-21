@@ -1,0 +1,165 @@
+name: 每日更新小说并发布
+
+on:
+  schedule:
+    # 每天北京时间早上8点（UTC 0点）执行
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 支持手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 下载并清理小说
+        id: download
+        run: python clean_and_release.py
+
+      - name: 获取上次Release的章节数
+        id: prev
+        run: |
+          # 获取最新Release的tag
+          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            echo "prev_chapters=0" >> $GITHUB_OUTPUT
+            echo "is_first_release=true" >> $GITHUB_OUTPUT
+          else
+            # 从tag中提取章节数，tag格式: v章节数-日期
+            PREV_CHAPTERS=$(echo "$PREV_TAG" | sed -n 's/^v\([0-9]*\)-.*/\1/p')
+            if [ -z "$PREV_CHAPTERS" ]; then
+              PREV_CHAPTERS=0
+            fi
+            echo "prev_chapters=$PREV_CHAPTERS" >> $GITHUB_OUTPUT
+            echo "is_first_release=false" >> $GITHUB_OUTPUT
+          fi
+          echo "上次章节数: $PREV_CHAPTERS"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算新增章节并准备Release信息
+        id: release_info
+        run: |
+          CURRENT=${{ steps.download.outputs.total_chapters }}
+          PREV=${{ steps.prev.outputs.prev_chapters }}
+          NEW_CHAPTERS=$((CURRENT - PREV))
+          DATE=$(date +%Y%m%d)
+          TAG="v${CURRENT}-${DATE}"
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "new_chapters=$NEW_CHAPTERS" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+
+          # 如果章节数没有变化，跳过发布
+          if [ "$NEW_CHAPTERS" -le 0 ] && [ "${{ steps.prev.outputs.is_first_release }}" = "false" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "章节数没有变化，跳过发布"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 创建Release说明
+        if: steps.release_info.outputs.skip == 'false'
+        id: notes
+        run: |
+          TITLE="${{ steps.download.outputs.title }}"
+          AUTHOR="${{ steps.download.outputs.author }}"
+          STATUS="${{ steps.download.outputs.status }}"
+          CURRENT="${{ steps.download.outputs.total_chapters }}"
+          NEW="${{ steps.release_info.outputs.new_chapters }}"
+          DATE="${{ steps.release_info.outputs.date }}"
+          IS_FIRST="${{ steps.prev.outputs.is_first_release }}"
+
+          {
+            echo "body<<RELEASE_EOF"
+            echo "## 📖 ${TITLE}"
+            echo ""
+            echo "**作者**: ${AUTHOR}"
+            echo ""
+            echo "**状态**: ${STATUS}"
+            echo ""
+            echo "**当前章节数**: 第${CURRENT}章"
+            echo ""
+            if [ "$IS_FIRST" = "true" ]; then
+              echo "**首次发布** 🎉"
+            else
+              echo "**本次新增**: ${NEW} 章"
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "**来源**: https://down7.ixdzs8.com/567128.zip"
+            echo ""
+            echo "**更新时间**: ${DATE}"
+            echo "RELEASE_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: 发布Release
+        if: steps.release_info.outputs.skip == 'false'
+        run: |
+          TAG="${{ steps.release_info.outputs.tag }}"
+          gh release create "$TAG" \
+            --title "${{ steps.download.outputs.title }} - ${{ steps.release_info.outputs.date }}" \
+            --notes "${{ steps.notes.outputs.body }}" \
+            output/*.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理旧版本Release（仅保留最新2个）
+        if: steps.release_info.outputs.skip == 'false'
+        run: |
+          # 获取所有release的tag，按时间倒序
+          TAGS=$(gh release list --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+          COUNT=0
+          for TAG in $TAGS; do
+            COUNT=$((COUNT + 1))
+            if [ $COUNT -gt 2 ]; then
+              echo "删除旧版本: $TAG"
+              gh release delete "$TAG" --yes --cleanup-tag
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 发送邮件通知
+        if: steps.release_info.outputs.skip == 'false'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.qq.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "📖 小说更新通知 - ${{ steps.download.outputs.title }}"
+          to: 282000500@qq.com
+          from: ${{ secrets.MAIL_USERNAME }}
+          body: |
+            小说更新通知
+            ============
+
+            📖 ${{ steps.download.outputs.title }}
+            ✍️ 作者: ${{ steps.download.outputs.author }}
+            📊 状态: ${{ steps.download.outputs.status }}
+            📝 当前章节数: 第${{ steps.download.outputs.total_chapters }}章
+            🆕 本次新增: ${{ steps.release_info.outputs.new_chapters }} 章
+
+            来源: https://down7.ixdzs8.com/567128.zip
+
+            ---
+            此邮件由 GitHub Actions 自动发送
+
+      - name: 输出跳过信息
+        if: steps.release_info.outputs.skip == 'true'
+        run: echo "📌 章节数没有更新，本次跳过发布。"

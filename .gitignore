@@ -1,0 +1,23 @@
+# 临时文件
+extracted/
+output/
+*.zip
+
+# 大文件（小说原文件不提交，通过脚本下载获取）
+*.txt
+!lm.txt
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
