@@ -108,7 +108,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**数据源**: 番茄小说网页版直接爬取"
+            echo "**数据源**: xbiqugu.la（笔趣阁）"
             echo ""
             echo "> 由 GitHub Actions 自动构建发布"
             echo "RELEASE_EOF"
