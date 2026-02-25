@@ -1,11 +1,9 @@
 # 临时文件
-extracted/
 output/
 *.zip
 
-# 大文件（小说原文件不提交，通过脚本下载获取）
-*.txt
-!lm.txt
+# 大文件（小说文件不提交，通过脚本下载后发布到Release）
+output/*.txt
 
 # 日志
 *.log
@@ -14,6 +12,9 @@ output/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 
 # macOS
 .DS_Store

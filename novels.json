@@ -1,0 +1,32 @@
+{
+  "novels": [
+    {
+      "name": "全民巨鱼求生：我能听到巨鱼心声",
+      "author": "失控云"
+    }
+  ],
+  "api_sources": [
+    "https://qkfqapi.vv9v.cn",
+    "https://bk.yydjtc.cn",
+    "https://fq.shusan.cn",
+    "http://43.248.77.205:22222",
+    "http://47.108.80.161:5005",
+    "http://101.35.133.34:5000",
+    "http://49.232.137.12",
+    "http://103.236.91.147:9999"
+  ],
+  "api_endpoints": {
+    "search": "/api/search",
+    "detail": "/api/detail",
+    "book": "/api/book",
+    "chapter": "/api/chapter",
+    "content": "/api/content",
+    "raw_full": "/api/raw_full"
+  },
+  "download": {
+    "max_workers": 10,
+    "max_retries": 3,
+    "request_timeout": 60,
+    "chapter_delay": 0.1
+  }
+}
