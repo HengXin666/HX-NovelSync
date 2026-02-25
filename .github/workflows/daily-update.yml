@@ -27,6 +27,17 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 恢复上次下载状态
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            output/
+          key: novel-state-${{ github.run_number }}
+          restore-keys: |
+            novel-state-
+
       - name: 下载小说
         id: download
         run: python download_novels.py
@@ -34,13 +45,11 @@ jobs:
       - name: 检查下载结果
         id: check
         run: |
-          # 检查 output 目录是否有 txt 文件
           if [ -d "output" ] && [ "$(find output -name '*.txt' | wc -l)" -gt 0 ]; then
             echo "has_files=true" >> $GITHUB_OUTPUT
             FILE_COUNT=$(find output -name '*.txt' | wc -l)
             echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
             echo "✅ 找到 $FILE_COUNT 个小说文件"
-            # 列出所有文件
             find output -name '*.txt' -exec ls -lh {} \;
           else
             echo "has_files=false" >> $GITHUB_OUTPUT
@@ -72,12 +81,9 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "date=$DATE" >> $GITHUB_OUTPUT
 
-          # 读取下载详情
-          DETAILS='${{ steps.download.outputs.details }}'
           TOTAL_BOOKS='${{ steps.download.outputs.total_books }}'
           TOTAL_NOVELS='${{ steps.download.outputs.total_novels }}'
 
-          # 生成Release内容
           {
             echo "body<<RELEASE_EOF"
             echo "## 📚 小说自动同步更新"
@@ -90,7 +96,6 @@ jobs:
             echo ""
           } >> $GITHUB_OUTPUT
 
-          # 列出所有下载的txt文件
           for f in output/*.txt; do
             if [ -f "$f" ]; then
               BASENAME=$(basename "$f")
@@ -103,7 +108,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**数据源**: 番茄小说API"
+            echo "**数据源**: 番茄小说网页版直接爬取"
             echo ""
             echo "> 由 GitHub Actions 自动构建发布"
             echo "RELEASE_EOF"
@@ -134,6 +139,15 @@ jobs:
           done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 保存状态到仓库
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json novels.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "📝 更新下载状态 [skip ci]"
+          git push || true
 
       - name: 发送邮件通知
         if: steps.check.outputs.has_files == 'true'

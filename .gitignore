@@ -1,9 +1,8 @@
 # 临时文件
 output/
+_downloader/
+_downloads/
 *.zip
-
-# 大文件（小说文件不提交，通过脚本下载后发布到Release）
-output/*.txt
 
 # 日志
 *.log
@@ -22,3 +21,6 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# 状态文件（不忽略，需要提交到仓库持久化）
+# state.json
