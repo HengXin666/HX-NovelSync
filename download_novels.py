@@ -11,6 +11,7 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import parsel
@@ -787,43 +788,48 @@ def process_novel(novel: dict, state: dict) -> dict:
             existing_content = ""
             print(f"  ⚠️ 加载已有内容失败，将从头下载")
 
-    # 下载新章节
+    # 下载新章节（并行下载）
     chapters_to_download = chapters[prev_count:]
-    downloaded_content = []
+    # 预分配结果列表，保证章节顺序
+    downloaded_content = [None] * len(chapters_to_download)
     fail_count = 0
-    consecutive_fails = 0
+    max_workers = min(8, len(chapters_to_download))  # 并行度，最多8线程
 
-    for idx, chapter in enumerate(chapters_to_download):
+    def _download_one(idx_chapter):
+        """下载单章的线程任务"""
+        idx, chapter = idx_chapter
         chapter_num = prev_count + idx + 1
         title = chapter["title"]
-
-        # 显示进度（每50章或最后一章显示）
-        if idx % 50 == 0 or idx == len(chapters_to_download) - 1:
-            print(f"  📥 下载中: {chapter_num}/{total_chapters} - {title}")
-
         content = download_chapter_content(chapter["href"])
+        success = bool(content and len(content) > 10)
+        text = f"\n{title}\n\n{content}\n" if success else f"\n{title}\n\n[内容获取失败]\n"
+        return idx, chapter_num, title, text, success
 
-        if content and len(content) > 10:
-            downloaded_content.append(f"\n{title}\n\n{content}\n")
-            consecutive_fails = 0
-        else:
-            fail_count += 1
-            consecutive_fails += 1
-            downloaded_content.append(f"\n{title}\n\n[内容获取失败]\n")
+    print(f"  🚀 并行下载 (线程数: {max_workers})")
 
-            # 连续失败超过10次，可能 cookie 失效，重新初始化
-            if consecutive_fails >= 10:
-                print(f"  🔄 连续失败 {consecutive_fails} 次，重新初始化 cookie...")
-                init_cookie()
-                consecutive_fails = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_download_one, (idx, ch)): idx
+            for idx, ch in enumerate(chapters_to_download)
+        }
+        for future in as_completed(futures):
+            try:
+                idx, chapter_num, title, text, success = future.result()
+                downloaded_content[idx] = text
+                status = "✅" if success else "❌"
+                print(f"  � [{chapter_num}/{total_chapters}] {status} {title}")
+                if not success:
+                    fail_count += 1
+            except Exception as e:
+                idx = futures[future]
+                chapter_num = prev_count + idx + 1
+                title = chapters_to_download[idx]["title"]
+                downloaded_content[idx] = f"\n{title}\n\n[内容获取失败]\n"
+                fail_count += 1
+                print(f"  📥 [{chapter_num}/{total_chapters}] ❌ {title} ({e})")
 
-            # 连续失败超过30次，放弃
-            if consecutive_fails >= 30:
-                print(f"  ❌ 连续失败太多，中止下载")
-                break
-
-        # 请求间隔（避免被封）
-        time.sleep(random.uniform(0.1, 0.5))
+    # 过滤掉 None（理论上不会有）
+    downloaded_content = [c for c in downloaded_content if c is not None]
 
     # 合并内容
     new_content = "".join(downloaded_content)
