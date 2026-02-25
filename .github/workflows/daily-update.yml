@@ -40,7 +40,7 @@ jobs:
 
       - name: 下载小说
         id: download
-        run: python download_novels.py
+        run: python -u download_novels.py
 
       - name: 检查下载结果
         id: check
