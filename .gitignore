@@ -4,6 +4,10 @@ _downloader/
 _downloads/
 *.zip
 
+# Tomato-Novel-Downloader 相关
+bin/
+tomato_data/
+
 # 日志
 *.log
 

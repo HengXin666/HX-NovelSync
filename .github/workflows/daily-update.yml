@@ -27,16 +27,18 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 恢复上次下载状态
+      - name: 恢复上次下载缓存
         id: cache
         uses: actions/cache@v4
         with:
           path: |
             state.json
             output/
-          key: novel-cache-v2-${{ github.run_number }}
+            tomato_data/downloads/
+            bin/
+          key: novel-cache-v3-${{ github.run_number }}
           restore-keys: |
-            novel-cache-v2-
+            novel-cache-v3-
 
       - name: 验证缓存一致性
         run: |
@@ -64,20 +66,43 @@ jobs:
       - name: 下载小说
         id: download
         run: python -u download_novels.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 检查下载结果
         id: check
         run: |
-          if [ -d "output" ] && [ "$(find output -name '*.txt' | wc -l)" -gt 0 ]; then
+          if [ -d "output" ] && [ "$(find output -maxdepth 1 -name '*.txt' -o -name '*.epub' | wc -l)" -gt 0 ]; then
             echo "has_files=true" >> $GITHUB_OUTPUT
-            FILE_COUNT=$(find output -name '*.txt' | wc -l)
+            FILE_COUNT=$(find output -maxdepth 1 \( -name '*.txt' -o -name '*.epub' \) | wc -l)
             echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
             echo "✅ 找到 $FILE_COUNT 个小说文件"
-            find output -name '*.txt' -exec ls -lh {} \;
+            find output -maxdepth 1 \( -name '*.txt' -o -name '*.epub' \) -exec ls -lh {} \;
+            # 检查音频文件夹
+            AUDIO_DIRS=$(find output -maxdepth 1 -type d -name '*_audio' | wc -l)
+            if [ "$AUDIO_DIRS" -gt 0 ]; then
+              echo "has_audio=true" >> $GITHUB_OUTPUT
+              echo "🔊 找到 $AUDIO_DIRS 个音频文件夹"
+            else
+              echo "has_audio=false" >> $GITHUB_OUTPUT
+            fi
           else
             echo "has_files=false" >> $GITHUB_OUTPUT
+            echo "has_audio=false" >> $GITHUB_OUTPUT
             echo "❌ 没有下载到任何小说文件"
           fi
+
+      - name: 打包音频文件
+        if: steps.check.outputs.has_audio == 'true'
+        run: |
+          cd output
+          for dir in *_audio; do
+            if [ -d "$dir" ]; then
+              echo "📦 打包音频: $dir"
+              zip -r "${dir}.zip" "$dir"
+              echo "  ✅ 已生成: ${dir}.zip ($(du -h "${dir}.zip" | cut -f1))"
+            fi
+          done
 
       - name: 获取上次Release的信息
         if: steps.check.outputs.has_files == 'true'
@@ -119,11 +144,20 @@ jobs:
             echo ""
           } >> $GITHUB_OUTPUT
 
-          for f in output/*.txt; do
+          for f in output/*.txt output/*.epub; do
             if [ -f "$f" ]; then
               BASENAME=$(basename "$f")
               SIZE=$(du -h "$f" | cut -f1)
-              echo "- **${BASENAME%.txt}** (${SIZE})" >> $GITHUB_OUTPUT
+              echo "- **${BASENAME%.*}** (${SIZE})" >> $GITHUB_OUTPUT
+            fi
+          done
+
+          # 音频信息
+          for f in output/*_audio.zip; do
+            if [ -f "$f" ]; then
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              echo "- 🔊 **${BASENAME%.zip}** (${SIZE})" >> $GITHUB_OUTPUT
             fi
           done
 
@@ -141,6 +175,8 @@ jobs:
             echo ""
             echo "**数据源**: 番茄小说 (fanqienovel.com)"
             echo ""
+            echo "**下载引擎**: [Tomato-Novel-Downloader](https://github.com/zhongbai2333/Tomato-Novel-Downloader)"
+            echo ""
             echo "> 由 GitHub Actions 自动构建发布"
             echo "RELEASE_EOF"
           } >> $GITHUB_OUTPUT
@@ -149,10 +185,17 @@ jobs:
         if: steps.check.outputs.has_files == 'true'
         run: |
           TAG="${{ steps.release_info.outputs.tag }}"
+          # 收集要上传的文件
+          FILES=""
+          for f in output/*.txt output/*.epub output/*_audio.zip; do
+            if [ -f "$f" ]; then
+              FILES="$FILES $f"
+            fi
+          done
           gh release create "$TAG" \
             --title "📚 小说更新 - ${{ steps.release_info.outputs.date }}" \
             --notes "${{ steps.release_info.outputs.body }}" \
-            output/*.txt
+            $FILES
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -221,6 +264,7 @@ jobs:
                   latest = r.get("latest_chapter", "")
                   size = r.get("file_size", 0)
                   size_mb = size / 1024 / 1024 if size else 0
+                  audio_count = r.get("audio_count", 0)
 
                   lines.append("")
                   lines.append(f"  📕 《{name}》 - {author}")
@@ -235,6 +279,8 @@ jobs:
                       lines.append(f"     💾 文件大小: {size_mb:.1f} MB")
                   if fail_ch > 0:
                       lines.append(f"     ⚠️ 失败章节: {fail_ch} 章")
+                  if audio_count > 0:
+                      lines.append(f"     🔊 有声书: {audio_count} 个音频文件")
 
           if failed:
               lines.append("")

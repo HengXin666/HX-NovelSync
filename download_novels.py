@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-小说下载器 - 基于番茄小说API
-从番茄小说获取小说内容，支持断点续传、GitHub Actions 自动化。
-参考:
-  - https://github.com/zhongbai2333/Tomato-Novel-Downloader (Rust版)
-  - https://github.com/POf-L/Fanqie-novel-Downloader (Python版)
+HX-NovelSync - 小说自动同步
+通过调用 Tomato-Novel-Downloader 命令行工具下载番茄小说。
+参考: https://github.com/zhongbai2333/Tomato-Novel-Downloader
+
+本脚本负责编排：
+  1. 下载最新版 Tomato-Novel-Downloader Linux 二进制
+  2. 生成 config.yml 配置
+  3. 逐本调用 --download <book_id> 下载小说
+  4. 收集结果并输出到 GitHub Actions
 """
 
 import json
 import os
 import re
 import sys
+import glob
+import shutil
+import stat
+import subprocess
 import time
-import random
-import html
 from pathlib import Path
 
 import requests
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===================== 常量 =====================
 
@@ -28,386 +31,284 @@ CONFIG_FILE = WORK_DIR / "novels.json"
 OUTPUT_DIR = WORK_DIR / "output"
 STATE_FILE = WORK_DIR / "state.json"
 
-# 番茄小说 Web 端
-FANQIE_WEB_BASE = "https://fanqienovel.com"
+# Tomato-Novel-Downloader 相关
+TOMATO_REPO = "zhongbai2333/Tomato-Novel-Downloader"
+TOMATO_BIN_DIR = WORK_DIR / "bin"
+TOMATO_DATA_DIR = WORK_DIR / "tomato_data"  # 工作目录，存放 config.yml 和下载内容
+TOMATO_BIN_NAME = "tomato-novel-downloader"
 
-# 第三方代理 API 节点 (POf-L 风格接口)
-# 这些节点提供已解密的小说内容
-# 端点格式: /api/detail, /api/book, /api/content, /api/chapter
-THIRD_PARTY_NODES = [
-    "https://bk.yydjtc.cn",
-    "https://qkfqapi.vv9v.cn",
-    "https://fq.shusan.cn",
-]
-
-# ===================== 请求会话 =====================
-
-session = requests.Session()
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-]
-
-session.headers.update(
-    {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
-    }
-)
+# TTS 配置
+DEFAULT_TTS_VOICE = "zh-CN-YunxiNeural"  # 默认发音人
+DEFAULT_TTS_RATE = "+0%"
+DEFAULT_TTS_FORMAT = "mp3"
+DEFAULT_TTS_CONCURRENCY = 2
 
 
-# ===================== 工具函数 =====================
+# ===================== 下载二进制 =====================
 
 
-def sanitize_filename(filename):
-    """清理文件名中的非法字符（含中文标点，确保GitHub Release兼容）"""
-    # 替换常见非法字符和中文标点
-    result = re.sub(r'[\\/*?:"<>|：；""''【】]', '_', filename)
-    # 合并连续下划线
-    result = re.sub(r'_+', '_', result)
-    # 去除首尾下划线和空格
-    result = result.strip('_ ')
-    return result if result else "unknown"
+def get_latest_release_info():
+    """获取最新 Release 信息"""
+    url = f"https://api.github.com/repos/{TOMATO_REPO}/releases/latest"
+    headers = {}
+    # 如果有 GITHUB_TOKEN 则使用，避免限流
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"token {token}"
 
-
-def rotate_ua():
-    """随机切换 User-Agent"""
-    session.headers["User-Agent"] = random.choice(USER_AGENTS)
-
-
-# ===================== 番茄小说官方 Web API =====================
-
-
-def fanqie_get_book_info(book_id):
-    """
-    从番茄小说网页获取书籍信息
-    返回: (book_name, author, chapter_count, latest_chapter_title)
-    """
-    url = f"{FANQIE_WEB_BASE}/page/{book_id}"
     try:
-        rotate_ua()
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            return None, None, None, None
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as e:
-        print(f"    ⚠️ 访问番茄小说页面失败: {e}")
-        return None, None, None, None
+        print(f"  ⚠️ 获取 Release 信息失败: {e}")
 
-    html_text = resp.text
-
-    # 解析 __INITIAL_STATE__
-    pattern = r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;'
-    match = re.search(pattern, html_text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1).strip())
-            page = data.get("page", {})
-            book_name = page.get("bookName", "")
-            author = page.get("authorName", "")
-            chapter_count = page.get("chapterTotal", 0)
-            latest_chapter = page.get("lastChapterTitle", "")
-            if book_name or author:
-                return book_name, author, chapter_count, latest_chapter
-        except json.JSONDecodeError:
-            pass
-
-    # 正则兜底
-    book_name = _regex_field(html_text, "bookName")
-    author = _regex_field(html_text, "authorName") or _regex_field(html_text, "author")
-    chapter_count = _regex_int_field(html_text, "chapterTotal")
-    latest_chapter = _regex_field(html_text, "lastChapterTitle")
-
-    return book_name, author, chapter_count, latest_chapter
-
-
-def fanqie_get_chapter_list(book_id):
-    """
-    从番茄小说官方API获取章节列表
-    API: /api/reader/directory/detail?bookId={book_id}
-    返回: [(item_id, title), ...]
-    """
-    # 预热：先访问页面获取Cookie
+    # 如果 latest 失败，尝试列出所有 release 取第一个
     try:
-        rotate_ua()
-        session.get(f"{FANQIE_WEB_BASE}/page/{book_id}", timeout=10)
+        resp = requests.get(
+            f"https://api.github.com/repos/{TOMATO_REPO}/releases?per_page=1",
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, list):
+                return data[0]
     except Exception:
         pass
-    time.sleep(random.uniform(0.3, 0.8))
 
-    url = f"{FANQIE_WEB_BASE}/api/reader/directory/detail?bookId={book_id}"
-    json_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Referer": f"{FANQIE_WEB_BASE}/page/{book_id}",
-    }
+    return None
+
+
+def download_tomato_binary():
+    """下载最新版 Tomato-Novel-Downloader Linux amd64 二进制"""
+    print("  📥 获取 Tomato-Novel-Downloader 最新版本...")
+
+    release = get_latest_release_info()
+    if not release:
+        print("  ❌ 无法获取 Release 信息")
+        return None
+
+    tag = release.get("tag_name", "unknown")
+    print(f"  📌 最新版本: {tag}")
+
+    # 查找 Linux amd64 二进制（不是 musl 版，也不是 arm64）
+    target_asset = None
+    for asset in release.get("assets", []):
+        name = asset["name"]
+        # 匹配 TomatoNovelDownloader-Linux_amd64-xxx 但排除 musl 和 arm64
+        if "Linux" in name and "amd64" in name and "musl" not in name and "arm" not in name:
+            target_asset = asset
+            break
+
+    if not target_asset:
+        print("  ❌ 未找到 Linux amd64 二进制")
+        print(f"  可用 assets: {[a['name'] for a in release.get('assets', [])]}")
+        return None
+
+    download_url = target_asset["browser_download_url"]
+    file_name = target_asset["name"]
+    file_size = target_asset.get("size", 0)
+
+    print(f"  📦 下载: {file_name} ({file_size / 1024 / 1024:.1f}MB)")
+
+    os.makedirs(TOMATO_BIN_DIR, exist_ok=True)
+    bin_path = TOMATO_BIN_DIR / TOMATO_BIN_NAME
 
     try:
-        rotate_ua()
-        resp = session.get(url, timeout=15, headers=json_headers)
+        resp = requests.get(download_url, timeout=120, stream=True)
         if resp.status_code != 200:
-            print(f"    ⚠️ 章节列表API返回 HTTP {resp.status_code}")
-            return []
-        data = resp.json()
+            print(f"  ❌ 下载失败: HTTP {resp.status_code}")
+            return None
+
+        with open(bin_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        # 设置可执行权限
+        bin_path.chmod(bin_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        # 验证二进制
+        result = subprocess.run(
+            [str(bin_path), "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            version_info = result.stdout.strip() or result.stderr.strip()
+            print(f"  ✅ 二进制验证通过: {version_info}")
+            return bin_path
+        else:
+            print(f"  ⚠️ 二进制验证失败 (rc={result.returncode}): {result.stderr.strip()}")
+            return bin_path  # 仍然返回，可能只是版本输出格式不同
+
     except Exception as e:
-        print(f"    ⚠️ 获取章节列表失败: {e}")
-        return []
+        print(f"  ❌ 下载二进制失败: {e}")
+        return None
 
-    root = data.get("data", {})
-    if not isinstance(root, dict):
-        return []
 
-    result = []
+# ===================== 配置生成 =====================
 
-    # 解析 chapterListWithVolume（番茄小说实际返回的格式）
-    chapter_list_with_volume = root.get("chapterListWithVolume")
-    if isinstance(chapter_list_with_volume, list):
-        for volume in chapter_list_with_volume:
-            if isinstance(volume, list):
-                for ch in volume:
-                    if isinstance(ch, dict):
-                        item_id = ch.get("itemId") or ch.get("item_id")
-                        title = ch.get("title", f"第{len(result)+1}章")
-                        if item_id:
-                            result.append((str(item_id), title))
-        if result:
-            return result
 
-    # 兜底：使用 allItemIds
-    all_item_ids = root.get("allItemIds", [])
-    if isinstance(all_item_ids, list):
-        for i, item_id in enumerate(all_item_ids):
-            if isinstance(item_id, str) and item_id.strip():
-                result.append((item_id.strip(), f"第{i+1}章"))
+def generate_config_yml(enable_tts=False):
+    """
+    生成 Tomato-Novel-Downloader 的 config.yml
+    """
+    config = {
+        "old_cli": False,
+        "max_workers": 1,
+        "request_timeout": 15,
+        "max_retries": 5,
+        "max_wait_time": 1200,
+        "min_wait_time": 1000,
+        "novel_format": "txt",
+        "bulk_files": False,
+        "auto_clear_dump": True,
+        "auto_open_downloaded_files": False,
+        "save_path": str(TOMATO_DATA_DIR / "downloads"),
+        "use_official_api": True,
+        "api_endpoints": [],
+        "enable_audiobook": enable_tts,
+        "audiobook_voice": DEFAULT_TTS_VOICE,
+        "audiobook_rate": DEFAULT_TTS_RATE,
+        "audiobook_format": DEFAULT_TTS_FORMAT,
+        "audiobook_concurrency": DEFAULT_TTS_CONCURRENCY,
+        "audiobook_tts_provider": "edge",
+        "allow_overwrite_files": True,
+        "preferred_book_name_field": "book_name",
+    }
+
+    os.makedirs(TOMATO_DATA_DIR, exist_ok=True)
+    config_path = TOMATO_DATA_DIR / "config.yml"
+
+    # 手动写 YAML（避免引入 pyyaml 依赖）
+    lines = []
+    for key, value in config.items():
+        if isinstance(value, bool):
+            lines.append(f"{key}: {'true' if value else 'false'}")
+        elif isinstance(value, (int, float)):
+            lines.append(f"{key}: {value}")
+        elif isinstance(value, str):
+            # 对路径等含特殊字符的值用引号
+            if any(c in value for c in ":/\\{}[]#&*!|>'\"%@`"):
+                lines.append(f'{key}: "{value}"')
+            else:
+                lines.append(f"{key}: {value}")
+        elif isinstance(value, list):
+            if not value:
+                lines.append(f"{key}: []")
+            else:
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {item}")
+        else:
+            lines.append(f"{key}: {value}")
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"  📝 配置文件已生成: {config_path}")
+    if enable_tts:
+        print(f"  🔊 TTS 已启用 (发音人: {DEFAULT_TTS_VOICE}, 格式: {DEFAULT_TTS_FORMAT})")
+
+    return config_path
+
+
+# ===================== 执行下载 =====================
+
+
+def run_download(bin_path, book_id, book_name=""):
+    """
+    调用 Tomato-Novel-Downloader 下载指定书籍
+    返回: (success: bool, output: str)
+    """
+    cmd = [
+        str(bin_path),
+        "--download", str(book_id),
+        "--data-dir", str(TOMATO_DATA_DIR),
+    ]
+
+    display_name = f"《{book_name}》" if book_name else f"book_id={book_id}"
+    print(f"  🚀 执行下载: {display_name}")
+    print(f"  💻 命令: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30分钟超时
+            cwd=str(TOMATO_DATA_DIR),
+            env={**os.environ, "RUST_LOG": "info"},
+        )
+
+        output = result.stdout + "\n" + result.stderr
+        # 输出日志（逐行带前缀）
+        for line in output.strip().split("\n"):
+            if line.strip():
+                print(f"    | {line}")
+
+        if result.returncode == 0:
+            print(f"  ✅ 下载完成: {display_name}")
+            return True, output
+        else:
+            print(f"  ❌ 下载失败 (exit code={result.returncode}): {display_name}")
+            return False, output
+
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ 下载超时 (30分钟): {display_name}")
+        return False, "timeout"
+    except Exception as e:
+        print(f"  ❌ 执行异常: {e}")
+        return False, str(e)
+
+
+def find_downloaded_files(book_id):
+    """
+    查找下载完成的文件
+    Tomato-Novel-Downloader 的输出目录结构:
+      {save_path}/{book_id}_{book_name}/
+        ├── xxx.txt (或 xxx.epub)
+        └── {book_name}_audio/  (如果启用了TTS)
+            ├── 0001-第一章.mp3
+            └── ...
+    返回: {"txt_files": [...], "audio_dir": str|None, "book_dir": str|None}
+    """
+    downloads_dir = TOMATO_DATA_DIR / "downloads"
+    if not downloads_dir.exists():
+        return {"txt_files": [], "audio_dir": None, "book_dir": None}
+
+    # 查找以 book_id 开头的目录
+    book_dirs = []
+    for item in downloads_dir.iterdir():
+        if item.is_dir() and item.name.startswith(str(book_id)):
+            book_dirs.append(item)
+
+    if not book_dirs:
+        # 也可能直接在 downloads_dir 下
+        book_dirs = [downloads_dir]
+
+    result = {"txt_files": [], "audio_dir": None, "book_dir": None}
+
+    for book_dir in book_dirs:
+        result["book_dir"] = str(book_dir)
+
+        # 查找 txt 文件
+        for txt in book_dir.glob("*.txt"):
+            result["txt_files"].append(str(txt))
+
+        # 查找 epub 文件（如果有的话也收集）
+        for epub in book_dir.glob("*.epub"):
+            result["txt_files"].append(str(epub))
+
+        # 查找音频目录
+        for audio_dir in book_dir.iterdir():
+            if audio_dir.is_dir() and ("audio" in audio_dir.name.lower() or "tts" in audio_dir.name.lower()):
+                audio_files = list(audio_dir.glob("*.mp3")) + list(audio_dir.glob("*.wav"))
+                if audio_files:
+                    result["audio_dir"] = str(audio_dir)
+                    print(f"  🔊 找到 {len(audio_files)} 个音频文件: {audio_dir.name}")
 
     return result
-
-
-def _regex_field(text, field):
-    """正则提取JSON字段的字符串值"""
-    pattern = rf'"{re.escape(field)}"\s*:\s*"(.*?)"'
-    match = re.search(pattern, text)
-    if match:
-        raw = match.group(1)
-        try:
-            return json.loads(f'"{raw}"')
-        except json.JSONDecodeError:
-            return raw
-    return None
-
-
-def _regex_int_field(text, field):
-    """正则提取JSON字段的整数值"""
-    pattern = rf'"{re.escape(field)}"\s*:\s*(\d+)'
-    match = re.search(pattern, text)
-    if match:
-        try:
-            return int(match.group(1))
-        except ValueError:
-            pass
-    return None
-
-
-# ===================== 第三方代理 API (POf-L 风格) =====================
-
-
-class ThirdPartyAPI:
-    """第三方代理API管理器，支持多节点自动切换"""
-
-    def __init__(self, nodes=None):
-        self.nodes = list(nodes or THIRD_PARTY_NODES)
-        self._working_node = None
-        self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://fanqienovel.com/",
-            "Content-Type": "application/json",
-        })
-
-    def _request(self, endpoint, params, timeout=15):
-        """
-        带节点自动切换的请求
-        优先使用上次成功的节点
-        """
-        nodes_to_try = []
-        if self._working_node:
-            nodes_to_try.append(self._working_node)
-        nodes_to_try.extend(n for n in self.nodes if n != self._working_node)
-
-        for node in nodes_to_try:
-            url = f"{node.rstrip('/')}{endpoint}"
-            try:
-                resp = self._session.get(url, params=params, timeout=timeout, verify=False)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("code") == 200:
-                        self._working_node = node
-                        return data
-                elif resp.status_code == 500:
-                    # 服务端错误，可能是临时的
-                    continue
-            except Exception:
-                continue
-
-        return None
-
-    def probe_nodes(self):
-        """探测可用节点"""
-        print("  🔍 探测第三方API节点...")
-        available = []
-        for node in self.nodes:
-            try:
-                resp = self._session.get(
-                    f"{node.rstrip('/')}/api/detail",
-                    params={"book_id": "7404826300126333977"},
-                    timeout=8,
-                    verify=False,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("code") == 200:
-                        available.append(node)
-                        print(f"    ✅ {node}")
-                    else:
-                        print(f"    ❌ {node} (code={data.get('code')})")
-                else:
-                    print(f"    ❌ {node} (HTTP {resp.status_code})")
-            except Exception as e:
-                print(f"    ❌ {node} ({type(e).__name__})")
-
-        self.nodes = available
-        if available:
-            self._working_node = available[0]
-        return len(available) > 0
-
-    def get_book_detail(self, book_id):
-        """获取书籍详情"""
-        data = self._request("/api/detail", {"book_id": book_id})
-        if not data:
-            return None
-        detail = data.get("data", {})
-        if isinstance(detail, dict) and "data" in detail:
-            return detail["data"]
-        return detail
-
-    def get_chapter_list(self, book_id):
-        """获取章节列表（通过 /api/book）"""
-        data = self._request("/api/book", {"book_id": book_id})
-        if not data:
-            return None
-        level1 = data.get("data", {})
-        if isinstance(level1, dict) and "data" in level1:
-            return level1["data"]
-        return level1
-
-    def get_chapter_content(self, item_id):
-        """获取单章内容"""
-        # 优先 /api/chapter
-        data = self._request("/api/chapter", {"item_id": item_id}, timeout=10)
-        if data and data.get("data"):
-            return data["data"]
-
-        # 回退到 /api/content
-        data = self._request("/api/content", {"tab": "小说", "item_id": item_id}, timeout=15)
-        if data and data.get("data"):
-            return data["data"]
-
-        return None
-
-    def get_full_book(self, book_id):
-        """
-        尝试整本下载（批量模式）
-        返回: {item_id: content_text, ...} 或 None
-        """
-        nodes_to_try = []
-        if self._working_node:
-            nodes_to_try.append(self._working_node)
-        nodes_to_try.extend(n for n in self.nodes if n != self._working_node)
-
-        for node in nodes_to_try:
-            # 尝试 "批量" 和 "下载" 两种 tab
-            for tab in ["批量", "下载"]:
-                url = f"{node.rstrip('/')}/api/content"
-                params = {"tab": tab, "book_id": book_id}
-                try:
-                    resp = self._session.get(
-                        url, params=params, timeout=120, verify=False, stream=True
-                    )
-                    if resp.status_code != 200:
-                        continue
-
-                    raw = resp.content
-                    if len(raw) < 1000:
-                        continue
-
-                    data = json.loads(raw.decode("utf-8", errors="ignore"))
-                    if data.get("code") != 200:
-                        continue
-
-                    payload = data.get("data", {})
-                    # 批量模式返回 {data: {item_id: content, ...}}
-                    if isinstance(payload, dict):
-                        nested = payload.get("data")
-                        if isinstance(nested, dict) and len(nested) > 0:
-                            # 验证是 {item_id: content} 格式
-                            sample_keys = list(nested.keys())[:5]
-                            if all(str(k).isdigit() for k in sample_keys):
-                                result = {}
-                                for k, v in nested.items():
-                                    if isinstance(v, str):
-                                        result[str(k)] = v
-                                    elif isinstance(v, dict):
-                                        result[str(k)] = v.get("content", "") or v.get("text", "")
-                                if result:
-                                    self._working_node = node
-                                    return result
-                except Exception:
-                    continue
-
-        return None
-
-    @property
-    def available(self):
-        """是否有可用节点"""
-        return bool(self.nodes)
-
-
-# ===================== 内容清洗 =====================
-
-
-def clean_content(raw):
-    """
-    将 HTML/XHTML 内容清洗为纯文本
-    """
-    if not raw:
-        return ""
-
-    # 将 <br>, </p>, </div> 等视为换行
-    text = re.sub(r'(?is)<br\s*/?>|</p\s*>|</div\s*>|</section\s*>|</h[1-6]\s*>', '\n', raw)
-    # 将 <p> 开标签视为换行
-    text = re.sub(r'(?is)<p\b[^>]*>', '\n', text)
-    # 移除其余所有标签
-    text = re.sub(r'<[^>]+>', '', text)
-    # 统一换行符
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # 解码 HTML 实体
-    text = html.unescape(text)
-
-    # 按段落整理，添加缩进
-    paragraphs = []
-    for line in text.split('\n'):
-        trimmed = line.strip()
-        if trimmed:
-            paragraphs.append(f"　　{trimmed}")
-
-    return '\n'.join(paragraphs)
 
 
 # ===================== 状态管理 =====================
@@ -433,13 +334,19 @@ def save_state(state):
         print(f"  ⚠️ 保存状态失败: {e}")
 
 
+def sanitize_filename(filename):
+    """清理文件名中的非法字符"""
+    result = re.sub(r'[\\/*?:"<>|：；""''【】]', '_', filename)
+    result = re.sub(r'_+', '_', result)
+    result = result.strip('_ ')
+    return result if result else "unknown"
+
+
 # ===================== 主处理逻辑 =====================
 
 
-def process_novel(novel, state, third_party_api):
-    """
-    处理单本小说的完整流程
-    """
+def process_novel(novel, state, bin_path, enable_tts=False):
+    """处理单本小说"""
     name = novel["name"]
     author = novel["author"]
     book_id = novel.get("book_id", "")
@@ -454,242 +361,98 @@ def process_novel(novel, state, third_party_api):
 
     print(f"  📌 book_id: {book_id}")
 
-    # ==================== 1. 获取书籍信息 ====================
-    print("  🔍 获取书籍信息...")
-    real_name = name  # 优先使用用户配置的名称
-    real_author = author
+    # 执行下载
+    success, output = run_download(bin_path, book_id, name)
 
-    # 先尝试第三方API
-    if third_party_api.available:
-        detail = third_party_api.get_book_detail(book_id)
-        if detail and isinstance(detail, dict):
-            api_author = detail.get("author", "")
-            if api_author:
-                real_author = api_author
-            api_name = detail.get("book_name", "")
-            if api_name and api_name != name:
-                print(f"  📝 API书名: {api_name}")
-
-    # 从番茄网页获取补充信息
-    web_name, web_author, web_chapter_count, web_latest = fanqie_get_book_info(book_id)
-    if web_author and not real_author:
-        real_author = web_author
-
-    print(f"  📚 {real_name} - {real_author}")
-    if web_chapter_count:
-        print(f"  📊 页面显示共 {web_chapter_count} 章")
-
-    # ==================== 2. 获取章节列表 ====================
-    print("  📋 获取章节列表...")
-    chapters = fanqie_get_chapter_list(book_id)
-    total_chapters = len(chapters)
-
-    if total_chapters == 0:
-        print("  ❌ 未获取到章节列表")
-        return {"name": real_name, "author": real_author, "success": False, "reason": "no_chapters"}
-
-    print(f"  📊 共获取 {total_chapters} 章")
-
-    latest_chapter_title = chapters[-1][1] if chapters else (web_latest or "")
-    print(f"  📖 最新章节: {latest_chapter_title}")
-
-    # ==================== 3. 检查增量更新 ====================
-    state_key = str(book_id)
-    prev_state = state.get(state_key, {})
-    prev_count = prev_state.get("chapter_count", 0)
-    prev_content_file = prev_state.get("content_file", "")
-
-    if prev_count >= total_chapters:
-        print(f"  ✅ 无新章节 (已有 {prev_count} 章)")
-        target_filename = f"{sanitize_filename(real_name)}-{sanitize_filename(real_author)}.txt"
-        target_path = OUTPUT_DIR / target_filename
-        if prev_content_file and Path(prev_content_file).exists():
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            import shutil
-            shutil.copy2(prev_content_file, target_path)
+    if not success:
         return {
-            "name": real_name, "author": real_author, "success": True,
-            "filename": target_filename, "new_chapters": 0,
-            "total_chapters": total_chapters, "latest_chapter": latest_chapter_title,
+            "name": name, "author": author, "success": False,
+            "reason": f"download_failed",
         }
 
-    new_count = total_chapters - prev_count
-    print(f"  🆕 新增 {new_count} 章 (从第 {prev_count+1} 章开始)")
+    # 查找下载的文件
+    files = find_downloaded_files(book_id)
 
-    # ==================== 4. 下载内容 ====================
-    target_filename = f"{sanitize_filename(real_name)}-{sanitize_filename(real_author)}.txt"
-    target_path = OUTPUT_DIR / target_filename
+    if not files["txt_files"]:
+        print("  ⚠️ 未找到下载的文本文件")
+        return {
+            "name": name, "author": author, "success": False,
+            "reason": "no_output_files",
+        }
+
+    # 将文件复制到 output 目录，以标准命名格式
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    target_filename = f"{sanitize_filename(name)}-{sanitize_filename(author)}.txt"
+    target_path = OUTPUT_DIR / target_filename
 
-    # 加载已有内容（增量更新）
-    existing_content = ""
-    if prev_count > 0:
-        content_loaded = False
-        # 优先尝试 prev_content_file
-        if prev_content_file and Path(prev_content_file).exists():
-            try:
-                with open(prev_content_file, "r", encoding="utf-8") as f:
-                    existing_content = f.read()
-                if existing_content.strip():
-                    content_loaded = True
-                    print(f"  📄 加载已有内容 ({prev_count} 章)")
-            except Exception:
-                pass
-        # 如果 prev_content_file 不可用，尝试从 target_path 加载
-        if not content_loaded and target_path.exists():
-            try:
-                with open(target_path, "r", encoding="utf-8") as f:
-                    existing_content = f.read()
-                if existing_content.strip():
-                    content_loaded = True
-                    print(f"  📄 从输出文件加载已有内容 ({prev_count} 章)")
-            except Exception:
-                pass
-        # 如果仍然加载失败，从头下载
-        if not content_loaded:
-            prev_count = 0
-            existing_content = ""
-            print("  ⚠️ 已有内容文件不存在或无法加载，将从头下载全部章节")
-
-    chapters_to_download = chapters[prev_count:]
-    downloaded_content = [None] * len(chapters_to_download)
-    fail_count = 0
-
-    # ---- 策略1: 尝试第三方API整本下载（批量模式） ----
-    full_book_data = None
-    if third_party_api.available and prev_count == 0:
-        print("  🚀 尝试极速下载模式（整本批量）...")
-        full_book_data = third_party_api.get_full_book(book_id)
-        if full_book_data:
-            matched = 0
-            for i, (item_id, title) in enumerate(chapters_to_download):
-                raw = full_book_data.get(item_id, "")
-                if raw and len(raw.strip()) > 20:
-                    content = clean_content(raw)
-                    downloaded_content[i] = f"\n{title}\n\n{content}\n"
-                    matched += 1
-            print(f"  📥 极速模式: 匹配到 {matched}/{len(chapters_to_download)} 章")
-            if matched >= len(chapters_to_download) * 0.95:
-                # 大多数章节成功，标记剩余为失败
-                for i in range(len(chapters_to_download)):
-                    if downloaded_content[i] is None:
-                        downloaded_content[i] = f"\n{chapters_to_download[i][1]}\n\n[内容获取失败]\n"
-                        fail_count += 1
-                # 跳过后续下载
-                full_book_data = "DONE"
-            else:
-                full_book_data = None
-                downloaded_content = [None] * len(chapters_to_download)
-                print("  ⚠️ 极速模式匹配率不足，切换到逐章下载")
-
-    # ---- 策略2: 第三方API逐章下载 ----
-    if full_book_data != "DONE" and third_party_api.available:
-        print("  📥 使用第三方API逐章下载...")
-        chapters_remaining = [(i, ch) for i, ch in enumerate(chapters_to_download) if downloaded_content[i] is None]
-
-        for idx, (i, (item_id, title)) in enumerate(chapters_remaining):
-            chapter_num = prev_count + i + 1
-            try:
-                ch_data = third_party_api.get_chapter_content(item_id)
-                if ch_data and isinstance(ch_data, dict):
-                    raw = ch_data.get("content", "")
-                    api_title = ch_data.get("title", "") or ch_data.get("origin_chapter_title", "")
-                    display_title = api_title if api_title else title
-
-                    if raw and len(raw.strip()) > 20:
-                        content = clean_content(raw)
-                        downloaded_content[i] = f"\n{display_title}\n\n{content}\n"
-                        if (idx + 1) % 50 == 0 or idx == 0:
-                            print(f"  📥 [{chapter_num}/{total_chapters}] ✅ {display_title}")
-                        continue
-            except Exception:
-                pass
-
-            # 当前章节未获取到
-            if (idx + 1) % 50 == 0:
-                print(f"  📥 [{chapter_num}/{total_chapters}] ❌ {title}")
-
-            # 适当延迟，避免限频
-            if (idx + 1) % 20 == 0:
-                time.sleep(random.uniform(0.2, 0.5))
-
-    # ---- 策略3: 直接从番茄小说网页抓取章节内容（兜底，有字体混淆） ----
-    chapters_still_missing = [(i, ch) for i, ch in enumerate(chapters_to_download) if downloaded_content[i] is None]
-    if chapters_still_missing:
-        print(f"  🌐 还有 {len(chapters_still_missing)} 章未获取，尝试从番茄网页直接抓取...")
-        for idx, (i, (item_id, title)) in enumerate(chapters_still_missing):
-            chapter_num = prev_count + i + 1
-            try:
-                rotate_ua()
-                resp = session.get(f"{FANQIE_WEB_BASE}/reader/{item_id}", timeout=15)
-                if resp.status_code == 200:
-                    # 解析 __INITIAL_STATE__
-                    pattern = r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;'
-                    match = re.search(pattern, resp.text, re.DOTALL)
-                    if match:
-                        page_data = json.loads(match.group(1).strip())
-                        reader = page_data.get("reader", {})
-                        chapter_data = reader.get("chapterData", {})
-                        raw = chapter_data.get("content", "")
-                        page_title = chapter_data.get("title", "") or chapter_data.get("chapterTitle", "")
-                        display_title = page_title if page_title else title
-
-                        if raw and len(raw.strip()) > 20:
-                            content = clean_content(raw)
-                            downloaded_content[i] = f"\n{display_title}\n\n{content}\n"
-                            if (idx + 1) % 50 == 0 or idx == 0:
-                                print(f"  📥 [{chapter_num}/{total_chapters}] ✅ {display_title} (网页)")
-                            # 延迟，避免被封
-                            time.sleep(random.uniform(0.3, 0.8))
-                            continue
-            except Exception:
-                pass
-
-            # 最终标记为失败
-            downloaded_content[i] = f"\n{title}\n\n[内容获取失败]\n"
-            fail_count += 1
-            if (idx + 1) % 50 == 0:
-                print(f"  📥 [{chapter_num}/{total_chapters}] ❌ {title}")
-
-            if (idx + 1) % 10 == 0:
-                time.sleep(random.uniform(0.5, 1.0))
-
-    # ==================== 5. 合并并保存 ====================
-    # 过滤掉 None（不应存在，但以防万一）
-    for i in range(len(downloaded_content)):
-        if downloaded_content[i] is None:
-            downloaded_content[i] = f"\n{chapters_to_download[i][1]}\n\n[内容获取失败]\n"
-            fail_count += 1
-
-    new_content = "".join(downloaded_content)
-    if existing_content:
-        full_content = existing_content + new_content
-    else:
-        full_content = f"《{real_name}》\n作者：{real_author}\n\n{'='*40}\n" + new_content
-
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(full_content)
-
+    # 取第一个 txt 文件
+    src_file = files["txt_files"][0]
+    shutil.copy2(src_file, target_path)
     file_size = target_path.stat().st_size
-    print(f"  💾 已保存: {target_filename} ({file_size/1024/1024:.1f}MB)")
-    print(f"  📊 下载 {len(chapters_to_download)} 章, 失败 {fail_count} 章")
+    print(f"  💾 已复制到: {target_filename} ({file_size / 1024 / 1024:.1f}MB)")
+
+    # 如果有音频文件，也打包复制到 output
+    audio_info = None
+    if files["audio_dir"]:
+        audio_src = Path(files["audio_dir"])
+        audio_dest = OUTPUT_DIR / f"{sanitize_filename(name)}-{sanitize_filename(author)}_audio"
+        if audio_dest.exists():
+            shutil.rmtree(audio_dest)
+        shutil.copytree(audio_src, audio_dest)
+        audio_count = len(list(audio_dest.glob("*.mp3"))) + len(list(audio_dest.glob("*.wav")))
+        audio_info = {"dir": str(audio_dest), "count": audio_count}
+        print(f"  🔊 音频已复制: {audio_count} 个文件")
+
+    # 解析章节信息（从输出中提取或从文件统计）
+    chapter_count = 0
+    latest_chapter = ""
+
+    # 尝试从下载输出中解析章节信息
+    # Tomato-Novel-Downloader 会输出类似 "开始下载：xxx (1441 章)" 的信息
+    ch_match = re.search(r'(\d+)\s*章', output)
+    if ch_match:
+        chapter_count = int(ch_match.group(1))
+
+    # 尝试从 txt 文件中获取最后一个章节标题
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # 查找最后一个章节标题（通常格式为 "第xxx章 xxx"）
+        chapter_titles = re.findall(r'(第\d+章\s+\S+)', content)
+        if chapter_titles:
+            latest_chapter = chapter_titles[-1].strip()
+            if not chapter_count:
+                chapter_count = len(chapter_titles)
+    except Exception:
+        pass
+
+    print(f"  📊 章节数: {chapter_count}")
+    if latest_chapter:
+        print(f"  📖 最新章节: {latest_chapter}")
 
     # 更新状态
+    state_key = str(book_id)
     state[state_key] = {
-        "name": real_name,
-        "author": real_author,
-        "chapter_count": total_chapters,
-        "latest_chapter": latest_chapter_title,
+        "name": name,
+        "author": author,
+        "chapter_count": chapter_count,
+        "latest_chapter": latest_chapter,
         "content_file": str(target_path),
         "last_update": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    return {
-        "name": real_name, "author": real_author, "success": True,
+    result = {
+        "name": name, "author": author, "success": True,
         "filename": target_filename, "file_size": file_size,
-        "new_chapters": new_count, "total_chapters": total_chapters,
-        "fail_count": fail_count, "latest_chapter": latest_chapter_title,
+        "new_chapters": chapter_count,  # 首次下载时 new == total
+        "total_chapters": chapter_count,
+        "fail_count": 0, "latest_chapter": latest_chapter,
     }
+
+    if audio_info:
+        result["audio_count"] = audio_info["count"]
+
+    return result
 
 
 def load_config():
@@ -706,29 +469,42 @@ def main():
     print("=" * 60)
     print("📚 HX-NovelSync - 小说自动同步")
     print("   数据源: 番茄小说 (fanqienovel.com)")
+    print("   引擎: Tomato-Novel-Downloader")
     print("=" * 60)
 
+    # 加载配置
     config = load_config()
     novels = config.get("novels", [])
+    enable_tts = config.get("enable_tts", False)
 
     if not novels:
         print("❌ 配置中没有定义任何小说")
         sys.exit(1)
 
     print(f"📋 共 {len(novels)} 本小说待处理")
+    if enable_tts:
+        print(f"🔊 TTS 有声书生成: 已启用")
 
-    # 初始化第三方API
-    third_party_api = ThirdPartyAPI()
-    third_party_api.probe_nodes()
-    if not third_party_api.available:
-        print("  ⚠️ 所有第三方API节点不可用，将使用番茄小说网页直接抓取（可能有字体混淆）")
+    # 步骤1: 下载 Tomato-Novel-Downloader 二进制
+    print(f"\n{'='*50}")
+    print("🔧 准备下载工具...")
+    print(f"{'='*50}")
+    bin_path = download_tomato_binary()
+    if not bin_path:
+        print("❌ 无法获取 Tomato-Novel-Downloader，尝试使用备用方案...")
+        # 如果下载二进制失败，可以尝试使用旧的 Python 方式（但这里先不实现）
+        sys.exit(1)
 
+    # 步骤2: 生成配置文件
+    generate_config_yml(enable_tts=enable_tts)
+
+    # 步骤3: 逐本处理
     state = load_state()
     results = []
 
     for novel in novels:
         try:
-            result = process_novel(novel, state, third_party_api)
+            result = process_novel(novel, state, bin_path, enable_tts)
             results.append(result)
         except Exception as e:
             print(f"  ❌ 《{novel['name']}》处理异常: {e}")
@@ -756,6 +532,8 @@ def main():
         print(f"  ✅ {r['name']} - {r['author']} ({size_mb:.1f}MB, {new_ch}新/{total_ch}总, {fail}失败)")
         if latest:
             print(f"     📖 最新: {latest}")
+        if r.get("audio_count"):
+            print(f"     🔊 音频: {r['audio_count']} 个文件")
     for r in fail_list:
         print(f"  ❌ {r['name']} - {r['author']} ({r.get('reason', 'unknown')})")
     print(f"{'='*60}")
@@ -769,7 +547,7 @@ def main():
             details_json = json.dumps(results, ensure_ascii=False)
             f.write(f"details={details_json}\n")
             if success_list:
-                filenames = ",".join(r["filename"] for r in success_list)
+                filenames = ",".join(r["filename"] for r in success_list if r.get("filename"))
                 f.write(f"filenames={filenames}\n")
 
     if not success_list:
