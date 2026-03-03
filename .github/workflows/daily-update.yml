@@ -34,9 +34,32 @@ jobs:
           path: |
             state.json
             output/
-          key: novel-state-${{ github.run_number }}
+          key: novel-cache-v2-${{ github.run_number }}
           restore-keys: |
-            novel-state-
+            novel-cache-v2-
+
+      - name: 验证缓存一致性
+        run: |
+          # 如果 state.json 记录了内容文件，但文件不存在，则清除 state
+          if [ -f "state.json" ]; then
+            python3 -c "
+          import json, os
+          with open('state.json', 'r') as f:
+              state = json.load(f)
+          needs_reset = False
+          for book_id, info in state.items():
+              cf = info.get('content_file', '')
+              if cf and not os.path.exists(cf):
+                  print(f'⚠️ 缓存文件不存在: {cf}，将从头下载')
+                  needs_reset = True
+          if needs_reset:
+              with open('state.json', 'w') as f:
+                  json.dump({}, f)
+              print('🔄 已重置 state.json')
+          else:
+              print('✅ 缓存状态一致')
+          "
+          fi
 
       - name: 下载小说
         id: download
@@ -157,6 +180,119 @@ jobs:
           git diff --cached --quiet || git commit -m "📝 更新下载状态 [skip ci]"
           git push || true
 
+      - name: 生成邮件正文
+        if: steps.check.outputs.has_files == 'true'
+        id: mail_body
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          details_raw = os.environ.get("NOVEL_DETAILS", "[]")
+          date_str = os.environ.get("RELEASE_DATE", "")
+          total_books = os.environ.get("TOTAL_BOOKS", "0")
+          total_novels = os.environ.get("TOTAL_NOVELS", "0")
+          repo_url = os.environ.get("GITHUB_REPO_URL", "")
+
+          try:
+              details = json.loads(details_raw)
+          except Exception:
+              details = []
+
+          lines = []
+          lines.append("📚 HX-NovelSync 小说自动同步更新通知")
+          lines.append("=" * 42)
+          lines.append("")
+          lines.append(f"📅 更新时间: {date_str}")
+          lines.append(f"📊 处理结果: {total_books}/{total_novels} 本成功")
+          lines.append("")
+
+          success = [d for d in details if d.get("success")]
+          failed = [d for d in details if not d.get("success")]
+
+          if success:
+              lines.append("📖 更新详情:")
+              lines.append("-" * 42)
+              for r in success:
+                  name = r.get("name", "未知")
+                  author = r.get("author", "未知")
+                  new_ch = r.get("new_chapters", 0)
+                  total_ch = r.get("total_chapters", 0)
+                  fail_ch = r.get("fail_count", 0)
+                  latest = r.get("latest_chapter", "")
+                  size = r.get("file_size", 0)
+                  size_mb = size / 1024 / 1024 if size else 0
+
+                  lines.append("")
+                  lines.append(f"  📕 《{name}》 - {author}")
+                  if new_ch > 0:
+                      lines.append(f"     🆕 本次新增: {new_ch} 章")
+                  else:
+                      lines.append(f"     ✅ 无新章节")
+                  lines.append(f"     📊 总章节数: {total_ch} 章")
+                  if latest:
+                      lines.append(f"     📖 最新章节: {latest}")
+                  if size_mb > 0:
+                      lines.append(f"     💾 文件大小: {size_mb:.1f} MB")
+                  if fail_ch > 0:
+                      lines.append(f"     ⚠️ 失败章节: {fail_ch} 章")
+
+          if failed:
+              lines.append("")
+              lines.append("❌ 失败列表:")
+              lines.append("-" * 42)
+              for r in failed:
+                  name = r.get("name", "未知")
+                  author = r.get("author", "未知")
+                  reason = r.get("reason", "未知原因")
+                  lines.append(f"  ❌ 《{name}》 - {author} ({reason})")
+
+          lines.append("")
+          lines.append("=" * 42)
+          if repo_url:
+              lines.append(f"📦 前往 Release 下载: {repo_url}/releases")
+          else:
+              lines.append("📦 下载的小说文件已发布到 GitHub Release")
+          lines.append("")
+          lines.append("-- ")
+          lines.append("此邮件由 GitHub Actions 自动发送")
+
+          body = "\n".join(lines)
+
+          # 写入 GITHUB_OUTPUT (使用 heredoc 格式处理多行)
+          output_file = os.environ.get("GITHUB_OUTPUT", "")
+          if output_file:
+              with open(output_file, "a", encoding="utf-8") as f:
+                  f.write("mail_body<<MAIL_EOF\n")
+                  f.write(body + "\n")
+                  f.write("MAIL_EOF\n")
+
+          # 同时生成邮件主题
+          subject_parts = []
+          for r in success:
+              name = r.get("name", "")
+              new_ch = r.get("new_chapters", 0)
+              if name and new_ch > 0:
+                  subject_parts.append(f"《{name}》+{new_ch}章")
+              elif name:
+                  subject_parts.append(f"《{name}》无更新")
+          if not subject_parts:
+              subject_line = f"📖 小说更新通知 - {date_str}"
+          elif len(subject_parts) == 1:
+              subject_line = f"📖 {subject_parts[0]} - {date_str}"
+          else:
+              subject_line = f"📖 {', '.join(subject_parts)} - {date_str}"
+
+          if output_file:
+              with open(output_file, "a", encoding="utf-8") as f:
+                  f.write(f"mail_subject={subject_line}\n")
+          PYEOF
+        env:
+          NOVEL_DETAILS: ${{ steps.download.outputs.details }}
+          RELEASE_DATE: ${{ steps.release_info.outputs.date }}
+          TOTAL_BOOKS: ${{ steps.download.outputs.total_books }}
+          TOTAL_NOVELS: ${{ steps.download.outputs.total_novels }}
+          GITHUB_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+
       - name: 发送邮件通知
         if: steps.check.outputs.has_files == 'true'
         continue-on-error: true
@@ -167,20 +303,10 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "📖 小说更新通知 - ${{ steps.release_info.outputs.date }}"
+          subject: ${{ steps.mail_body.outputs.mail_subject }}
           to: 282000500@qq.com
           from: ${{ secrets.MAIL_USERNAME }}
-          body: |
-            小说自动同步更新通知
-            =====================
-
-            📅 更新时间: ${{ steps.release_info.outputs.date }}
-            📊 处理结果: ${{ steps.download.outputs.total_books }}/${{ steps.download.outputs.total_novels }} 本成功
-
-            📦 下载的小说文件已发布到 GitHub Release
-
-            ---
-            此邮件由 GitHub Actions 自动发送
+          body: ${{ steps.mail_body.outputs.mail_body }}
 
       - name: 输出跳过信息
         if: steps.check.outputs.has_files != 'true'

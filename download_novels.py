@@ -67,8 +67,14 @@ session.headers.update(
 
 
 def sanitize_filename(filename):
-    """清理文件名中的非法字符"""
-    return re.sub(r'[\\/*?:"<>|]', "_", filename).strip()
+    """清理文件名中的非法字符（含中文标点，确保GitHub Release兼容）"""
+    # 替换常见非法字符和中文标点
+    result = re.sub(r'[\\/*?:"<>|：；""''【】]', '_', filename)
+    # 合并连续下划线
+    result = re.sub(r'_+', '_', result)
+    # 去除首尾下划线和空格
+    result = result.strip('_ ')
+    return result if result else "unknown"
 
 
 def rotate_ua():
@@ -517,15 +523,33 @@ def process_novel(novel, state, third_party_api):
 
     # 加载已有内容（增量更新）
     existing_content = ""
-    if prev_count > 0 and prev_content_file and Path(prev_content_file).exists():
-        try:
-            with open(prev_content_file, "r", encoding="utf-8") as f:
-                existing_content = f.read()
-            print(f"  📄 加载已有内容 ({prev_count} 章)")
-        except Exception:
+    if prev_count > 0:
+        content_loaded = False
+        # 优先尝试 prev_content_file
+        if prev_content_file and Path(prev_content_file).exists():
+            try:
+                with open(prev_content_file, "r", encoding="utf-8") as f:
+                    existing_content = f.read()
+                if existing_content.strip():
+                    content_loaded = True
+                    print(f"  📄 加载已有内容 ({prev_count} 章)")
+            except Exception:
+                pass
+        # 如果 prev_content_file 不可用，尝试从 target_path 加载
+        if not content_loaded and target_path.exists():
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    existing_content = f.read()
+                if existing_content.strip():
+                    content_loaded = True
+                    print(f"  📄 从输出文件加载已有内容 ({prev_count} 章)")
+            except Exception:
+                pass
+        # 如果仍然加载失败，从头下载
+        if not content_loaded:
             prev_count = 0
             existing_content = ""
-            print("  ⚠️ 加载已有内容失败，将从头下载")
+            print("  ⚠️ 已有内容文件不存在或无法加载，将从头下载全部章节")
 
     chapters_to_download = chapters[prev_count:]
     downloaded_content = [None] * len(chapters_to_download)
