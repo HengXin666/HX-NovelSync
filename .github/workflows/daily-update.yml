@@ -104,11 +104,19 @@ jobs:
             fi
           done
 
+          # 从 state.json 读取章节信息并写入 Release Notes
+          if [ -f "state.json" ]; then
+            echo "" >> $GITHUB_OUTPUT
+            echo "### 📊 章节信息" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            python3 release_info.py >> $GITHUB_OUTPUT
+          fi
+
           {
             echo ""
             echo "---"
             echo ""
-            echo "**数据源**: xbiqugu.la（笔趣阁）"
+            echo "**数据源**: 番茄小说 (fanqienovel.com)"
             echo ""
             echo "> 由 GitHub Actions 自动构建发布"
             echo "RELEASE_EOF"
